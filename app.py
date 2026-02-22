@@ -12,6 +12,7 @@ import json
 import os
 import urllib.request
 import urllib.parse
+import requests
 from pathlib import Path
 import logging
 from datetime import datetime, timedelta
@@ -33,6 +34,7 @@ DATA_GOV_IN_RESOURCE_IDS = [
 ]
 CEDA_AGMARKNET_BASE = "https://agmarknet.ceda.ashoka.edu.in/api"
 _ceda_commodities_cache = None
+from difflib import SequenceMatcher
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -57,6 +59,7 @@ market_model_cache = {}
 location_data = None
 soil_defaults = None
 global_market_processor = None  # Global market data processor
+state_soil_data = None
 
 SEASON_MONTHS = {
     "summer": [3, 4, 5, 6],
@@ -65,9 +68,13 @@ SEASON_MONTHS = {
     "spring": [2, 3, 4]
 }
 
+# Weather API Configuration
+WEATHER_API_KEY = "78c72e493fa14a03960131144262102"
+WEATHER_API_BASE = "https://api.weatherapi.com/v1/current.json"
+
 def load_models():
     """Load trained ML models and scalers"""
-    global crop_classifier, yield_predictor, feature_scaler, encoders_info, model_metadata, training_data, market_prices, location_data, soil_defaults, global_market_processor
+    global crop_classifier, yield_predictor, feature_scaler, encoders_info, model_metadata, training_data, market_prices, location_data, soil_defaults, global_market_processor, state_soil_data
     
     try:
         logger.info("Loading models...")
@@ -128,6 +135,15 @@ def load_models():
             logger.warning(f"Could not load location data: {e}")
             location_data = None
 
+        # Load state-wise official soil data
+        try:
+            state_soil_data = pd.read_csv(PROCESSED_DATA_DIR / "cleaned_statewise_n,p,k,ph_dataset.csv")
+            state_soil_data["State"] = state_soil_data["State"].astype(str).str.strip().str.lower()
+            logger.info(f"✓ State-wise soil data loaded: {state_soil_data.shape[0]} states")
+        except Exception as e:
+            logger.warning(f"Could not load state-wise soil data: {e}")
+            state_soil_data = None
+            
         # Load soil defaults from crop recommendation data
         try:
             soil_defaults = pd.read_csv(PROCESSED_DATA_DIR / "cleaned_Crop_recommendation.csv")
@@ -342,6 +358,93 @@ def health_check():
         "models": ["crop_classifier", "yield_predictor"]
     })
 
+@app.route('/api/weather', methods=['GET'])
+def get_weather():
+    """
+    Get real-time weather data for a city
+    
+    Query params:
+    - city: City name (required)
+    
+    Returns temperature, humidity, and rainfall data
+    """
+    try:
+        city = request.args.get('city', '').strip()
+        
+        if not city:
+            return jsonify({
+                "status": "error",
+                "message": "City name is required"
+            }), 400
+        
+        # Call WeatherAPI
+        response = requests.get(
+            WEATHER_API_BASE,
+            params={
+                'key': WEATHER_API_KEY,
+                'q': city,
+                'aqi': 'no'
+            },
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            return jsonify({
+                "status": "error",
+                "message": f"City not found: {city}"
+            }), 404
+        
+        weather_data = response.json()
+        current = weather_data.get('current', {})
+        
+        # Extract relevant parameters
+        temperature = current.get('temp_c', 25.0)
+        humidity = current.get('humidity', 70.0)
+        
+        # Estimate rainfall from precipitation (mm)
+        # WeatherAPI provides precip_mm - convert to cm for our model (which expects rainfall in cm)
+        rainfall_mm = current.get('precip_mm', 0.0)
+        rainfall_cm = rainfall_mm / 10.0  # Convert mm to cm
+        
+        # For daily estimation, if no precip data use seasonal average
+        # This is a simple heuristic - could be improved with forecast data
+        if rainfall_cm == 0:
+            rainfall_cm = 15.0  # Default estimate if no rain
+        
+        return jsonify({
+            "status": "success",
+            "city": city,
+            "weather_data": {
+                "temperature": round(temperature, 2),
+                "humidity": round(humidity, 2),
+                "rainfall": round(rainfall_cm, 2),
+                "condition": current.get('condition', {}).get('text', 'Unknown'),
+                "wind_kmh": current.get('wind_kph', 0),
+                "pressure_mb": current.get('pressure_mb', 0),
+                "latitude": weather_data.get('location', {}).get('lat'),
+                "longitude": weather_data.get('location', {}).get('lon')
+            },
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    except requests.exceptions.Timeout:
+        return jsonify({
+            "status": "error",
+            "message": "Weather API request timed out"
+        }), 504
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Weather API error: {e}")
+        return jsonify({
+            "status": "error",
+            "message": "Failed to fetch weather data"
+        }), 500
+    except Exception as e:
+        logger.error(f"Error in weather endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
 @app.route('/api/crops/list', methods=['GET'])
 def get_crop_list():
     """Get list of all available crops"""
@@ -377,6 +480,113 @@ def get_locations():
         logger.error(f"Error getting locations: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/api/geo-district', methods=['GET'])
+def get_district_from_coords():
+    """
+    Find best matching district from latitude and longitude
+    Uses reverse geocoding + fuzzy string matching against database
+    
+    Query params:
+    - lat: Latitude (required)
+    - lon: Longitude (required)
+    - state: State name (optional, for narrowing down search)
+    """
+    try:
+        lat = request.args.get('lat', '')
+        lon = request.args.get('lon', '')
+        state = request.args.get('state', '').strip()
+        
+        if not lat or not lon:
+            return jsonify({"status": "error", "message": "Latitude and longitude required"}), 400
+        
+        # Reverse geocode to get district info
+        geo_response = requests.get(
+            f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}",
+            timeout=10
+        )
+        if geo_response.status_code != 200:
+            return jsonify({"status": "error", "message": "Reverse geocoding failed"}), 500
+        
+        geo_data = geo_response.json()
+        address = geo_data.get('address', {})
+        
+        # Extract potential district names from various fields
+        district_candidates = [
+            address.get('county'),
+            address.get('district'),
+            address.get('municipality'),
+            address.get('borough'),
+            address.get('suburb'),
+            address.get('city'),
+            address.get('town'),
+        ]
+        district_candidates = [d for d in district_candidates if d]  # Remove None/empty
+        
+        if location_data is None or location_data.empty:
+            return jsonify({"status": "error", "message": "Location data not available"}), 404
+        
+        # Get list of districts for the state
+        if state:
+            # Normalize state name
+            state_normalized = state.lower().strip()
+            available_districts = location_data[
+                location_data['state_name'].str.lower() == state_normalized
+            ]['dist_name'].dropna().unique().tolist()
+        else:
+            available_districts = location_data['dist_name'].dropna().unique().tolist()
+        
+        # Fuzzy match: find best district match
+        best_match = None
+        best_score = 0.0
+        
+        for candidate in district_candidates:
+            for db_district in available_districts:
+                # Try various matching strategies
+                # 1. Exact match (case-insensitive)
+                if candidate.lower() == db_district.lower():
+                    best_match = db_district
+                    best_score = 1.0
+                    break
+                
+                # 2. Contains match
+                if candidate.lower() in db_district.lower() or db_district.lower() in candidate.lower():
+                    score = 0.9
+                    if score > best_score:
+                        best_match = db_district
+                        best_score = score
+                
+                # 3. Fuzzy match using sequence matcher
+                similarity = SequenceMatcher(None, candidate.lower(), db_district.lower()).ratio()
+                if similarity > best_score:
+                    best_match = db_district
+                    best_score = similarity
+            
+            if best_score >= 0.8:  # Stop if we have a good match
+                break
+        
+        if best_match and best_score >= 0.6:
+            logger.info(f"✓ Detected district: {best_match} (score: {best_score:.2f}) from coords {lat},{lon}")
+            return jsonify({
+                "status": "success",
+                "district": best_match,
+                "confidence": round(best_score * 100, 2),
+                "state": state,
+                "candidate_names": district_candidates[:3]
+            })
+        else:
+            logger.warning(f"⚠ No district match found for coords {lat},{lon}")
+            return jsonify({
+                "status": "no_match",
+                "message": "Could not detect district from coordinates",
+                "candidate_names": district_candidates[:3]
+            }), 200
+    
+    except requests.exceptions.Timeout:
+        return jsonify({"status": "error", "message": "Geocoding request timed out"}), 504
+    except Exception as e:
+        logger.error(f"Error in geo-district: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route('/api/soil-data', methods=['GET'])
 def get_soil_data():
     """Get average soil parameters based on location"""
@@ -387,7 +597,33 @@ def get_soil_data():
         if not state:
             return jsonify({"status": "error", "message": "State is required"}), 400
         
-        # Use soil defaults from crop recommendation data (averaged values)
+        state_key = normalize_text(state)
+        
+        # Try to use government state-wise data first (most accurate)
+        if state_soil_data is not None and not state_soil_data.empty:
+            state_match = state_soil_data[state_soil_data['State'] == state_key]
+            
+            if not state_match.empty:
+                row = state_match.iloc[0]
+                soil_params = {
+                    'nitrogen': float(row['Nitrogen']),
+                    'phosphorus': float(row['Phosphorus']),
+                    'potassium': float(row['Potassium']),
+                    'ph': float(row['pH']),
+                    'state': state,
+                    'district': district,
+                    'data_source': 'government_statewise_data'
+                }
+                
+                logger.info(f"✓ Using govt data for {state}: N={row['Nitrogen']}, P={row['Phosphorus']}, K={row['Potassium']}, pH={row['pH']}")
+                
+                return jsonify({
+                    "status": "success",
+                    "soil_data": soil_params,
+                    "message": f"Official soil data for {state}"
+                })
+        
+        # Fallback to crop recommendation dataset averages with state variations
         if soil_defaults is None or soil_defaults.empty:
             return jsonify({
                 "status": "error",
@@ -395,13 +631,12 @@ def get_soil_data():
             }), 404
         
         # Get average NPK and pH values from the dataset
-        # For now, provide typical values - in production, this could be location-specific
         n_avg = float(soil_defaults['n'].mean())
         p_avg = float(soil_defaults['p'].mean())
         k_avg = float(soil_defaults['k'].mean())
         ph_avg = float(soil_defaults['ph'].mean())
         
-        # Add some variation based on state (simplified approach)
+        # Add some variation based on state (simplified approach - fallback only)
         state_variations = {
             'punjab': {'n': 1.1, 'p': 1.0, 'k': 0.9, 'ph': 1.0},
             'haryana': {'n': 1.1, 'p': 1.0, 'k': 0.9, 'ph': 1.0},
@@ -411,7 +646,6 @@ def get_soil_data():
             'tamil nadu': {'n': 0.9, 'p': 1.1, 'k': 1.0, 'ph': 0.97},
         }
         
-        state_key = normalize_text(state)
         variation = state_variations.get(state_key, {'n': 1.0, 'p': 1.0, 'k': 1.0, 'ph': 1.0})
         
         soil_params = {
@@ -423,6 +657,8 @@ def get_soil_data():
             'district': district,
             'data_source': 'aggregated_crop_data'
         }
+        
+        logger.warning(f"⚠ Using fallback data for {state} (govt data not found)")
         
         return jsonify({
             "status": "success",
@@ -503,6 +739,7 @@ def recommend_crop():
     """
     try:
         data = request.json
+        logger.info(f"📥 Received crop recommendation request: {data}")
         
         # Validate required fields
         required_fields = ['nitrogen', 'phosphorus', 'potassium', 'temperature', 
@@ -533,6 +770,8 @@ def recommend_crop():
             data.get('water_stress', 50)  # water_stress
         ]])
         
+        logger.info(f"🔢 Feature vector shape: {features.shape}, first 7 features: {features[0][:7]}")
+        
         # Scale features
         features_scaled = feature_scaler.transform(features)
         
@@ -542,6 +781,11 @@ def recommend_crop():
         
         # Get top recommendations
         top_indices = np.argsort(probabilities)[-5:][::-1]
+        
+        logger.info(f"🎯 Top 5 prediction indices: {top_indices}")
+        logger.info(f"🌾 Top 5 crops: {[crop_names[i] for i in top_indices]}")
+        logger.info(f"📊 Top 5 probabilities: {[round(probabilities[i]*100, 2) for i in top_indices]}")
+        
         recommendations = []
         
         for idx in top_indices:
@@ -557,6 +801,8 @@ def recommend_crop():
                 "estimated_yield": round(float(yield_pred), 2),
                 "unit": "kg/ha"
             })
+        
+        logger.info(f"✅ Returning primary recommendation: {recommendations[0]['crop']}")
         
         return jsonify({
             "status": "success",
