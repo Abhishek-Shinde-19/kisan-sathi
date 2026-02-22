@@ -9,11 +9,31 @@ import numpy as np
 import pandas as pd
 import joblib
 import json
+import os
+import urllib.request
+import urllib.parse
 import requests
 from pathlib import Path
 import logging
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
+import sys
+sys.path.insert(0, str(Path(__file__).parent / 'training'))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+AGMARKET_API_KEY = os.environ.get("AGMARKET_API_KEY", "").strip()
+DATA_GOV_IN_API_KEY = os.environ.get("DATA_GOV_IN_API_KEY", "").strip() or AGMARKET_API_KEY
+DATA_GOV_IN_RESOURCE_IDS = [
+    "variety-wise-daily-market-prices-data-commodity",
+    "9ef84268-d588-465a-a308-a864a43d0070",
+]
+CEDA_AGMARKNET_BASE = "https://agmarknet.ceda.ashoka.edu.in/api"
+_ceda_commodities_cache = None
 from difflib import SequenceMatcher
 
 # Configure logging
@@ -38,6 +58,7 @@ market_prices = None
 market_model_cache = {}
 location_data = None
 soil_defaults = None
+global_market_processor = None  # Global market data processor
 state_soil_data = None
 
 SEASON_MONTHS = {
@@ -53,7 +74,7 @@ WEATHER_API_BASE = "https://api.weatherapi.com/v1/current.json"
 
 def load_models():
     """Load trained ML models and scalers"""
-    global crop_classifier, yield_predictor, feature_scaler, encoders_info, model_metadata, training_data, market_prices, location_data, soil_defaults, state_soil_data
+    global crop_classifier, yield_predictor, feature_scaler, encoders_info, model_metadata, training_data, market_prices, location_data, soil_defaults, global_market_processor, state_soil_data
     
     try:
         logger.info("Loading models...")
@@ -114,6 +135,15 @@ def load_models():
             logger.warning(f"Could not load location data: {e}")
             location_data = None
 
+        # Load state-wise official soil data
+        try:
+            state_soil_data = pd.read_csv(PROCESSED_DATA_DIR / "cleaned_statewise_n,p,k,ph_dataset.csv")
+            state_soil_data["State"] = state_soil_data["State"].astype(str).str.strip().str.lower()
+            logger.info(f"✓ State-wise soil data loaded: {state_soil_data.shape[0]} states")
+        except Exception as e:
+            logger.warning(f"Could not load state-wise soil data: {e}")
+            state_soil_data = None
+            
         # Load soil defaults from crop recommendation data
         try:
             soil_defaults = pd.read_csv(PROCESSED_DATA_DIR / "cleaned_Crop_recommendation.csv")
@@ -122,15 +152,18 @@ def load_models():
             logger.warning(f"Could not load soil defaults: {e}")
             soil_defaults = None
         
-        # Load state-wise NPK data from government dataset
+        # Load global market processor for FAOSTAT data
         try:
-            state_soil_data = pd.read_csv(PROCESSED_DATA_DIR / "cleaned_statewise_n,p,k,ph_dataset.csv")
-            # Normalize state names for matching
-            state_soil_data['State'] = state_soil_data['State'].str.strip().str.lower()
-            logger.info(f"✓ State-wise soil data loaded: {state_soil_data.shape[0]} states")
+            from training.global_market_processor import GlobalMarketProcessor
+            faostat_path = Path(__file__).parent / "data" / "processed" / "FAOSTAT_data_en_2-22-2026 (added countries).csv"
+            if faostat_path.exists():
+                global_market_processor = GlobalMarketProcessor(str(faostat_path))
+                logger.info(f"✓ Global market data loaded: {len(global_market_processor.get_countries())} countries, {len(global_market_processor.get_commodities())} commodities")
+            else:
+                logger.warning(f"FAOSTAT data file not found: {faostat_path}")
         except Exception as e:
-            logger.warning(f"Could not load state-wise soil data: {e}")
-            state_soil_data = None
+            logger.warning(f"Could not load global market data: {e}")
+            global_market_processor = None
         
         logger.info("✓ All models loaded successfully!")
         return True
@@ -138,10 +171,29 @@ def load_models():
         logger.error(f"Error loading models: {e}")
         return False
 
+# Initialize models on module import
+def _initialize_app():
+    """Initialize app on import"""
+    global market_prices
+    if market_prices is None:
+        logger.info("Initializing models on module import...")
+        if not load_models():
+            logger.error("Failed to initialize models on import")
+
+# Call initialization after load_models is defined
+_initialize_app()
+
 def normalize_text(value: str) -> str:
     if value is None:
         return ""
     return str(value).strip().lower()
+
+def _get_available_crops_set():
+    """Return set of crop names (lowercase) that we have market data for."""
+    if market_prices is None or market_prices.empty:
+        return set()
+    return set(market_prices["commodity"].astype(str).str.strip().str.lower().unique())
+
 
 def filter_market_prices(crop: str, state: str = None, district: str = None, market: str = None):
     if market_prices is None:
@@ -174,24 +226,71 @@ def apply_season_filter(df: pd.DataFrame, season: str = None):
     filtered = df[df["month"].isin(SEASON_MONTHS[season_key])].copy()
     return filtered, True
 
+def classify_trend_90day(df: pd.DataFrame) -> dict:
+    """Classify trend using 90 days of data with improved statistical methods"""
+    if df.shape[0] < 20:
+        return {"trend": "stable", "strength": 0, "confidence": 0.3}
+    
+    df_sorted = df.sort_values("price_date").copy()
+    prices = df_sorted["modal_price"].values
+    
+    # Split 90-day data into three 30-day periods for better analysis
+    n = len(prices)
+    period_size = max(1, n // 3)
+    
+    early_period = prices[:period_size]
+    late_period = prices[-period_size:]
+    
+    early_avg = float(np.mean(early_period)) if len(early_period) > 0 else 0
+    late_avg = float(np.mean(late_period)) if len(late_period) > 0 else 0
+    mid_period = prices[period_size:2*period_size]
+    mid_avg = float(np.mean(mid_period)) if len(mid_period) > 0 else 0
+    
+    # Calculate price change across 90 days
+    if early_avg > 0:
+        price_change_pct = ((late_avg - early_avg) / early_avg) * 100
+    else:
+        price_change_pct = 0
+    
+    # Linear regression for trend strength
+    x = np.arange(len(prices))
+    coefficients = np.polyfit(x, prices, 1)
+    slope = coefficients[0]
+    mean_price = np.mean(prices)
+    
+    if mean_price > 0:
+        normalized_slope = (slope / mean_price) * 100
+    else:
+        normalized_slope = 0
+    
+    # Determine trend with improved thresholds based on 90-day data
+    trend = "stable"
+    strength = 0
+    confidence = min(0.95, 0.5 + (len(prices) / 90.0) * 0.45)
+    
+    if normalized_slope > 0.15:  # Improved threshold for 90 days
+        trend = "increasing"
+        strength = min(100, abs(normalized_slope))
+    elif normalized_slope < -0.15:
+        trend = "decreasing"
+        strength = min(100, abs(normalized_slope))
+    else:
+        trend = "stable"
+        strength = abs(normalized_slope)
+    
+    return {
+        "trend": trend,
+        "strength": round(strength, 2),
+        "confidence": round(confidence, 3),
+        "price_change_pct": round(price_change_pct, 2),
+        "early_avg": round(early_avg, 2),
+        "late_avg": round(late_avg, 2)
+    }
+
 def classify_trend(df: pd.DataFrame) -> str:
-    if df.shape[0] < 10:
-        return "stable"
-
-    df_sorted = df.sort_values("price_date")
-    x = df_sorted["date_ordinal"].values
-    y = df_sorted["modal_price"].values
-    slope = np.polyfit(x, y, 1)[0]
-    mean_price = float(np.mean(y)) if len(y) else 0
-    if mean_price <= 0:
-        return "stable"
-
-    normalized_slope = slope / mean_price
-    if normalized_slope > 0.0005:
-        return "increasing"
-    if normalized_slope < -0.0005:
-        return "decreasing"
-    return "stable"
+    """Legacy function wrapper for backward compatibility"""
+    result = classify_trend_90day(df)
+    return result["trend"]
 
 def classify_stability(df: pd.DataFrame) -> str:
     if df.shape[0] < 10:
@@ -207,6 +306,8 @@ def classify_stability(df: pd.DataFrame) -> str:
     if cv < 0.15:
         return "moderate"
     return "volatile"
+
+
 
 def forecast_price_ml(df: pd.DataFrame, cache_key: str):
     if df.shape[0] < 30:
@@ -785,29 +886,124 @@ def predict_yield():
             "message": str(e)
         }), 500
 
+def get_agmarket_trend_data(crop, state=None, district=None, market=None, days=90):
+    """Fetch trend data from agmarket API - NOT USED for 90-day forecasts.
+    90-day predictions are exclusively from local CSV dataset for consistency and reliability."""
+    try:
+        # Try to fetch live data from agmarket
+        records, err = fetch_agmarket_live(crop, source="auto")
+        
+        if not records or err:
+            logger.info(f"No agmarket data for {crop}, falling back to local data")
+            return None
+        
+        # Convert agmarket API records to time-series DataFrame
+        processed_records = []
+        
+        for record in records:
+            try:
+                # Parse date from various formats
+                date_str = record.get("date", "")
+                if not date_str:
+                    continue
+                
+                # Try parsing different date formats
+                parsed_date = None
+                for fmt in ["%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y"]:
+                    try:
+                        parsed_date = datetime.strptime(str(date_str).strip(), fmt)
+                        break
+                    except:
+                        continue
+                
+                if not parsed_date:
+                    continue
+                
+                # Filter by state/district/market if provided
+                record_state = record.get("state", "").strip().lower()
+                record_district = record.get("district", "").strip().lower()
+                record_market = record.get("market", "").strip().lower()
+                
+                if state and state.lower() not in record_state:
+                    continue
+                if district and district.lower() not in record_district:
+                    continue
+                if market and market.lower() not in record_market:
+                    continue
+                
+                modal_price = float(record.get("modal_price") or 0)
+                if modal_price <= 0:
+                    continue
+                
+                processed_records.append({
+                    "price_date": parsed_date,
+                    "date_ordinal": parsed_date.toordinal(),
+                    "month": parsed_date.month,
+                    "dayofyear": parsed_date.timetuple().tm_yday,
+                    "modal_price": modal_price,
+                    "min_price": float(record.get("min_price") or modal_price),
+                    "max_price": float(record.get("max_price") or modal_price),
+                    "market": record.get("market", ""),
+                    "state": record.get("state", ""),
+                    "district": record.get("district", "")
+                })
+            except Exception as e:
+                logger.debug(f"Error processing agmarket record: {e}")
+                continue
+        
+        if not processed_records:
+            logger.info(f"No valid agmarket records for {crop} after filtering")
+            return None
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(processed_records)
+        
+        # Sort by date and drop duplicates (keep last occurrence)
+        df = df.sort_values("price_date")
+        df = df.drop_duplicates(subset=["price_date"], keep="last")
+        
+        # Filter to last N days
+        latest_date = df["price_date"].max()
+        cutoff_date = latest_date - timedelta(days=days)
+        df = df[df["price_date"] >= cutoff_date].copy()
+        
+        logger.info(f"Successfully fetched {len(df)} agmarket records for {crop}")
+        return df if len(df) > 0 else None
+        
+    except Exception as e:
+        logger.error(f"Error fetching agmarket trend data for {crop}: {e}")
+        return None
+
 @app.route('/api/market-insights/<crop>', methods=['GET'])
 def market_insights(crop):
-    """Get market insights for a specific crop"""
+    """Get market insights for a specific crop using local dataset and 30-day forecasts"""
     try:
         state = request.args.get("state")
         district = request.args.get("district")
         market = request.args.get("market")
         season = request.args.get("season")
-
+        
+        crop_data = None
+        data_source = "local_csv"
+        
+        # Use local dataset
         crop_data_all = filter_market_prices(crop, state=state, district=district, market=market)
         season_filtered_data, season_filter_applied = apply_season_filter(crop_data_all, season)
         crop_data = season_filtered_data if not season_filtered_data.empty else crop_data_all
+        data_source = "local_csv"
+        logger.info(f"Using local CSV data for {crop} - {len(crop_data)} records")
 
-        if crop_data.empty:
+        if crop_data is None or crop_data.empty:
             return jsonify({
                 "status": "success",
                 "crop": crop,
                 "has_market_data": False,
+                "data_source": data_source,
                 "market_data": {
                     "demand_trend": "no data",
                     "price_stability": "no data",
                     "global_demand": "no data",
-                    "recommendation": f"No price records found for {crop} in current market dataset."
+                    "recommendation": f"No price records found for {crop} in market dataset. Try a different crop."
                 },
                 "optimal_conditions": {
                     "temperature_range": "20-30°C",
@@ -833,19 +1029,22 @@ def market_insights(crop):
         latest_date = latest_row["price_date"]
         latest_price = float(latest_row["modal_price"])
 
+        # Get 30-day data for trend analysis
         last_30 = crop_data[crop_data["price_date"] >= latest_date - timedelta(days=30)]
-        last_90 = crop_data[crop_data["price_date"] >= latest_date - timedelta(days=90)]
+        
         avg_30 = float(last_30["modal_price"].mean()) if not last_30.empty else latest_price
-        avg_90 = float(last_90["modal_price"].mean()) if not last_90.empty else avg_30
 
-        price_change_90 = 0.0
-        if avg_90:
-            price_change_90 = ((avg_30 - avg_90) / avg_90) * 100
-
-        trend = classify_trend(last_90 if not last_90.empty else crop_data)
-        stability = classify_stability(last_90 if not last_90.empty else crop_data)
+        # Use trend analysis on available historical data
+        trend_analysis = classify_trend_90day(crop_data)
+        trend = trend_analysis["trend"]
+        trend_strength = trend_analysis["strength"]
+        trend_confidence = trend_analysis["confidence"]
+        
+        stability = classify_stability(crop_data)
 
         cache_key = f"{normalize_text(crop)}|{normalize_text(state)}|{normalize_text(district)}|{normalize_text(market)}"
+        
+        # Get 30-day forecast
         forecast = forecast_price_ml(crop_data, cache_key)
 
         if stability == "volatile":
@@ -857,18 +1056,26 @@ def market_insights(crop):
 
         demand_trend = "high" if trend == "increasing" else "moderate" if trend == "stable" else "low"
 
-        recommendation = f"{crop.title()} prices are {trend}."
+        recommendation = f"{crop.title()} prices show {trend} trend with {trend_strength:.1f}% strength"
         if forecast:
-            recommendation += f" 30-day expected average is about {forecast['avg']:.1f}."
+            recommendation += f". Expected 30-day average: ₹{forecast['avg']:.1f}/quintal"
+        recommendation += "."
 
         insights = {
             "status": "success",
             "crop": crop,
             "has_market_data": True,
+            "data_source": data_source,
             "market_data": {
                 "demand_trend": demand_trend,
                 "price_stability": stability,
                 "global_demand": trend,
+                "trend_details": {
+                    "trend": trend,
+                    "strength": round(trend_strength, 2),
+                    "confidence": round(trend_confidence, 3),
+                    "period_days": len(crop_data)
+                },
                 "latest_price": {
                     "value": round(latest_price, 2),
                     "unit": "INR/quintal",
@@ -879,7 +1086,6 @@ def market_insights(crop):
                     "unit": "INR/quintal",
                     "days": 30
                 },
-                "price_change_90d_pct": round(price_change_90, 2),
                 "forecast_30d": {
                     "avg": round(forecast["avg"], 2) if forecast else None,
                     "min": round(forecast["min"], 2) if forecast else None,
@@ -908,20 +1114,537 @@ def market_insights(crop):
             },
             "data_coverage": {
                 "records": int(crop_data.shape[0]),
+                "last_30_records": int(last_30.shape[0]),
                 "from": crop_data["price_date"].min().strftime("%Y-%m-%d"),
                 "to": latest_date.strftime("%Y-%m-%d"),
-                "season_filter_applied": season_filter_applied
+                "season_filter_applied": season_filter_applied,
+                "data_source": data_source,
+                "note": f"Using {len(last_30)} days of data for trend analysis"
             }
         }
         
         return jsonify(insights)
     
     except Exception as e:
-        logger.error(f"Error getting market insights: {e}")
+        logger.error(f"Error getting market insights for {crop}: {e}", exc_info=True)
         return jsonify({
             "status": "error",
+            "crop": crop,
             "message": str(e)
         }), 500
+
+
+@app.route('/api/market-insights/<crop>/chart-data', methods=['GET'])
+def market_insights_chart_data(crop):
+    """Get time series and mandi-wise price data for charts"""
+    try:
+        state = request.args.get("state")
+        district = request.args.get("district")
+        market = request.args.get("market")
+        crop_data = filter_market_prices(crop, state=state, district=district, market=market)
+        if crop_data.empty:
+            return jsonify({
+                "status": "success",
+                "crop": crop,
+                "time_series": [],
+                "by_mandi": [],
+                "message": "No price records for this crop."
+            })
+
+        crop_data = crop_data.sort_values("price_date")
+        latest_date = crop_data["price_date"].max()
+        cutoff = latest_date - timedelta(days=90)
+        recent = crop_data[crop_data["price_date"] >= cutoff]
+
+        ts_df = recent.groupby(recent["price_date"].dt.date).agg(
+            modal_price=("modal_price", "mean"),
+            min_price=("modal_price", "min"),
+            max_price=("modal_price", "max")
+        ).reset_index()
+        ts_df["price_date"] = ts_df["price_date"].astype(str)
+        time_series = [
+            {
+                "date": r["price_date"],
+                "modal_price": round(float(r["modal_price"]), 2),
+                "min_price": round(float(r["min_price"]), 2),
+                "max_price": round(float(r["max_price"]), 2)
+            }
+            for _, r in ts_df.iterrows()
+        ]
+
+        latest_date_only = latest_date.date() if hasattr(latest_date, "date") else latest_date
+        crop_latest = crop_data[crop_data["price_date"].dt.date == latest_date_only]
+        if crop_latest.empty:
+            crop_latest = crop_data[crop_data["price_date"] == latest_date]
+        latest_per_mandi = (
+            crop_latest
+            .groupby(["market", "state", "district"], as_index=False)
+            .agg(modal_price=("modal_price", "mean"), min_price=("modal_price", "min"), max_price=("modal_price", "max"))
+        )
+        by_mandi = [
+            {
+                "market": row["market"].title() if pd.notna(row["market"]) else "Unknown",
+                "state": row["state"].title() if pd.notna(row["state"]) else "",
+                "district": row["district"].title() if pd.notna(row["district"]) else "",
+                "modal_price": round(float(row["modal_price"]), 2),
+                "min_price": round(float(row["min_price"]), 2),
+                "max_price": round(float(row["max_price"]), 2),
+                "date": latest_date.strftime("%Y-%m-%d")
+            }
+            for _, row in latest_per_mandi.head(15).iterrows()
+        ]
+        by_mandi.sort(key=lambda x: x["modal_price"], reverse=True)
+
+        return jsonify({
+            "status": "success",
+            "crop": crop,
+            "time_series": time_series,
+            "by_mandi": by_mandi,
+            "latest_date": latest_date.strftime("%Y-%m-%d")
+        })
+    except Exception as e:
+        logger.error(f"Error getting chart data: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _fetch_ceda_commodities():
+    """Fetch CEDA commodity list. Returns list of {name, id} for display + lookup."""
+    global _ceda_commodities_cache
+    if _ceda_commodities_cache is not None:
+        return _ceda_commodities_cache
+    try:
+        url = CEDA_AGMARKNET_BASE + "/commodities"
+        req = urllib.request.Request(url, headers={"User-Agent": "KisanSathi/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        items = data.get("data") or []
+        _ceda_commodities_cache = [
+            {"name": (c.get("commodity_disp_name") or "").strip(), "id": c.get("commodity_id")}
+            for c in items if c.get("commodity_id")
+        ]
+        return _ceda_commodities_cache
+    except Exception as e:
+        logger.warning(f"CEDA commodities fetch failed: {e}")
+        return []
+
+
+COMMODITY_NAME_TO_CEDA = {
+    "paddy": "paddy", "rice": "rice", "wheat": "wheat", "maize": "maize",
+    "tomato": "tomato", "potato": "potato", "onion": "onion", "cotton": "cotton",
+    "sugarcane": "sugarcane", "groundnut": "groundnut", "banana": "banana",
+    "mango": "mango", "chickpea": "gram", "gram": "gram", "turmeric": "turmeric",
+    "ginger": "ginger", "red gram": "red gram", "black gram": "black gram",
+    "green gram": "green gram", "bajra": "bajra", "jowar": "jowar", "cauliflower": "cauliflower",
+    "brinjal": "brinjal", "cabbage": "cabbage", "green peas": "green peas",
+}
+
+
+def _resolve_ceda_commodity_id(commodity_name):
+    """Map crop name to CEDA commodity_id."""
+    name = normalize_text(commodity_name)
+    if not name:
+        return None
+    search_name = COMMODITY_NAME_TO_CEDA.get(name, name)
+    items = _fetch_ceda_commodities()
+    for item in items:
+        disp_name = item.get("name") or ""
+        cid = item.get("id")
+        if not disp_name or not cid:
+            continue
+        d = disp_name.lower()
+        s = search_name.lower()
+        if s in d or d.startswith(s):
+            return cid
+        if s.replace(" ", "") in d.replace(" ", "").replace("-", ""):
+            return cid
+        first = (d.split()[0] if d else "")
+        if s == first or s in first:
+            return cid
+    return None
+
+
+def _fetch_ceda_prices(commodity_id, api_key):
+    """Try to fetch price data from CEDA Agmarknet API. Returns (records, None) or (None, error)."""
+    if not commodity_id or not api_key:
+        return None, "missing_params"
+    headers = {
+        "User-Agent": "KisanSathi/1.0",
+        "Accept": "application/json",
+    }
+    endpts = [
+        f"{CEDA_AGMARKNET_BASE}/price_data?commodity_id={commodity_id}&state_id=0&api_key={api_key}",
+        f"{CEDA_AGMARKNET_BASE}/price-data?commodity_id={commodity_id}&state_id=0&api_key={api_key}",
+        f"{CEDA_AGMARKNET_BASE}/data?commodity_id={commodity_id}&api_key={api_key}",
+        f"{CEDA_AGMARKNET_BASE}/table?commodity_id={commodity_id}&api_key={api_key}",
+        f"{CEDA_AGMARKNET_BASE}/records?commodity_id={commodity_id}&api_key={api_key}",
+    ]
+    for url in endpts:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode())
+            rows = data.get("data") or data.get("records") or data.get("rows") or []
+            if rows:
+                return rows, None
+        except Exception as e:
+            logger.debug(f"CEDA endpoint {url[:60]}... failed: {e}")
+            continue
+    return None, "ceda_no_price_endpoint"
+
+
+def _normalize_ceda_record(r, commodity_name):
+    """Convert CEDA API record to our format."""
+    try:
+        modal = float(r.get("modal_price") or r.get("modal_price__rs_quintal") or r.get("Modal_Price") or 0)
+        min_p = float(r.get("min_price") or r.get("min_price__rs_quintal") or r.get("Min_Price") or modal)
+        max_p = float(r.get("max_price") or r.get("max_price__rs_quintal") or r.get("Max_Price") or modal)
+        market = (r.get("market") or r.get("market_name") or r.get("Market") or "Unknown").strip().title()
+        state = (r.get("state") or r.get("state_name") or r.get("State") or "").strip().title()
+        district = (r.get("district") or r.get("district_name") or r.get("District") or "").strip().title()
+        date_val = (r.get("arrival_date") or r.get("price_date") or r.get("date") or r.get("Date") or "").strip()
+        return {
+            "market": market,
+            "state": state,
+            "district": district,
+            "commodity": commodity_name.strip().title(),
+            "modal_price": round(modal, 2),
+            "min_price": round(min_p, 2),
+            "max_price": round(max_p, 2),
+            "date": date_val,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_ceda_agmarknet_live(commodity):
+    """Fetch live prices from CEDA Agmarknet (agmarknet.ceda.ashoka.edu.in)."""
+    if not AGMARKET_API_KEY:
+        return [], "no_api_key"
+    cid = _resolve_ceda_commodity_id(commodity)
+    if not cid:
+        return [], "commodity_not_found"
+    rows, err = _fetch_ceda_prices(cid, AGMARKET_API_KEY)
+    if err:
+        return [], err
+    out = []
+    for r in rows:
+        rec = _normalize_ceda_record(r, commodity)
+        if rec and rec.get("modal_price", 0) > 0:
+            out.append(rec)
+    return out, None
+
+
+def _normalize_data_gov_record(r, commodity):
+    """Parse a data.gov.in record - supports various field name conventions."""
+    modal = float(
+        r.get("modal_price") or r.get("Modal_Price") or r.get("modal_price__rs_quintal") or 0
+    )
+    min_p = float(
+        r.get("min_price") or r.get("Min_Price") or r.get("min_price__rs_quintal") or modal
+    )
+    max_p = float(
+        r.get("max_price") or r.get("Max_Price") or r.get("max_price__rs_quintal") or modal
+    )
+    if modal <= 0:
+        return None
+    return {
+        "market": (
+            r.get("market") or r.get("Market") or r.get("market_name") or "Unknown"
+        ).strip().title(),
+        "state": (r.get("state") or r.get("State") or "").strip().title(),
+        "district": (
+            r.get("district") or r.get("District") or r.get("district_name") or ""
+        ).strip().title(),
+        "commodity": (
+            r.get("commodity") or r.get("Commodity") or commodity
+        ).strip().title(),
+        "modal_price": round(modal, 2),
+        "min_price": round(min_p, 2),
+        "max_price": round(max_p, 2),
+        "date": (
+            r.get("arrival_date")
+            or r.get("Arrival_Date")
+            or r.get("price_date")
+            or r.get("date")
+            or ""
+        ).strip(),
+    }
+
+
+def fetch_data_gov_in_live(commodity):
+    """Fetch live mandi prices from data.gov.in (OGD) - primary source for Aaj ka bhav."""
+    if not DATA_GOV_IN_API_KEY:
+        return [], "no_api_key"
+    commodity_clean = commodity.strip()
+    filter_val = urllib.parse.quote(commodity_clean)
+    for resource_id in DATA_GOV_IN_RESOURCE_IDS:
+        for filter_key in ("commodity", "Commodity"):
+            url = (
+                f"https://api.data.gov.in/resource/{resource_id}"
+                f"?api-key={DATA_GOV_IN_API_KEY}"
+                f"&format=json&limit=100&offset=0"
+                f"&filters[{filter_key}]={filter_val}"
+            )
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "KisanSathi/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+            except Exception as e:
+                logger.debug(f"data.gov.in {resource_id[:8]}... failed: {e}")
+                continue
+            records = data.get("records") or data.get("data") or []
+            if not records:
+                continue
+            out = []
+            for r in records:
+                rec = _normalize_data_gov_record(r, commodity_clean)
+                if rec:
+                    out.append(rec)
+            if out:
+                return out, None
+    return [], "no_data"
+
+
+def fetch_agmarket_live(commodity, source="auto"):
+    """Fetch live mandi prices. data.gov.in first (for Aaj ka bhav), then CEDA."""
+    if source == "local":
+        return [], "local_only"
+    if not DATA_GOV_IN_API_KEY and not AGMARKET_API_KEY:
+        return [], "no_api_key"
+    
+    # Prefer data.gov.in (OGD) as primary live source for 'Aaj ka bhav'
+    records, err = fetch_data_gov_in_live(commodity)
+    if records:
+        return records, None
+        
+    # Fallback to CEDA Agmarknet if data.gov.in doesn't return data
+    records, err2 = fetch_ceda_agmarknet_live(commodity)
+    if records:
+        return records, None
+        
+    return [], err or err2
+
+
+def _get_local_chart_fallback(commodity, days=90):
+    """Build time_series + by_mandi from local market_prices for specified number of days."""
+    if market_prices is None:
+        return [], [], None
+    crop_data = filter_market_prices(commodity)
+    if crop_data.empty:
+        crop_key = normalize_text(commodity)
+        if crop_key and "commodity" in market_prices.columns:
+            mask = market_prices["commodity"].astype(str).str.contains(
+                crop_key, case=False, na=False, regex=False
+            )
+            crop_data = market_prices.loc[mask].copy()
+    if crop_data.empty:
+        return [], [], None
+    crop_data = crop_data.sort_values("price_date")
+    latest_date = crop_data["price_date"].max()
+    # Filter to requested number of days
+    cutoff_date = latest_date - timedelta(days=days-1)
+    recent = crop_data[crop_data["price_date"] >= cutoff_date]
+    ts_df = recent.groupby(recent["price_date"].dt.date).agg(
+        modal_price=("modal_price", "mean"),
+        min_price=("modal_price", "min"),
+        max_price=("modal_price", "max")
+    ).reset_index()
+    time_series = [
+        {
+            "date": str(r["price_date"]) if not isinstance(r["price_date"], str) else r["price_date"],
+            "modal_price": round(float(r["modal_price"]), 2),
+            "min_price": round(float(r["min_price"]), 2),
+            "max_price": round(float(r["max_price"]), 2),
+        }
+        for _, r in ts_df.iterrows()
+    ]
+    if time_series and len(time_series) < days:
+        from datetime import date
+        def parse_d(s):
+            s = str(s).strip()[:10]
+            try:
+                if "-" in s:
+                    return datetime.strptime(s, "%Y-%m-%d").date()
+                if "/" in s:
+                    parts = s.split("/")
+                    if len(parts) == 3:
+                        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+                        if y < 100:
+                            y += 2000
+                        return date(y, m, d)
+            except (ValueError, TypeError):
+                pass
+            return None
+        valid_ts = [(t, parse_d(t["date"])) for t in time_series]
+        valid_ts = [(t, dt) for t, dt in valid_ts if dt is not None]
+        if valid_ts:
+            dates_sorted = sorted([dt for _, dt in valid_ts])
+            price_by_date = {dt.strftime("%Y-%m-%d"): t for t, dt in valid_ts}
+            end_date = dates_sorted[-1]
+            start_date = end_date - timedelta(days=days - 1)
+            expanded = []
+            for i in range(days):
+                d = start_date + timedelta(days=i)
+                d_str = d.strftime("%Y-%m-%d")
+                if d_str in price_by_date:
+                    expanded.append(price_by_date[d_str])
+                else:
+                    nearest_dt = min(dates_sorted, key=lambda dt_key: abs((dt_key - d).days))
+                    nearest = nearest_dt.strftime("%Y-%m-%d")
+                    expanded.append({
+                        "date": d_str,
+                        "modal_price": price_by_date[nearest]["modal_price"],
+                        "min_price": price_by_date[nearest]["min_price"],
+                        "max_price": price_by_date[nearest]["max_price"],
+                    })
+            time_series = expanded
+    latest_date_only = latest_date.date() if hasattr(latest_date, "date") else latest_date
+    crop_latest = crop_data[crop_data["price_date"].dt.date == latest_date_only]
+    if crop_latest.empty:
+        crop_latest = crop_data[crop_data["price_date"] == latest_date]
+    latest_per_mandi = (
+        crop_latest
+        .groupby(["market", "state", "district"], as_index=False)
+        .agg(modal_price=("modal_price", "mean"), min_price=("modal_price", "min"), max_price=("modal_price", "max"))
+    )
+    by_mandi = [
+        {
+            "market": (row["market"].title() if pd.notna(row["market"]) else "Unknown"),
+            "district": (row["district"].title() if pd.notna(row["district"]) else ""),
+            "state": (row["state"].title() if pd.notna(row["state"]) else ""),
+            "modal_price": round(float(row["modal_price"]), 2),
+            "min_price": round(float(row["min_price"]), 2),
+            "max_price": round(float(row["max_price"]), 2),
+        }
+        for _, row in latest_per_mandi.head(15).iterrows()
+    ]
+    by_mandi.sort(key=lambda x: x["modal_price"], reverse=True)
+    latest_str = latest_date.strftime("%Y-%m-%d") if hasattr(latest_date, "strftime") else str(latest_date)
+    return time_series, by_mandi, latest_str
+
+
+@app.route('/api/agmarket/history', methods=['GET'])
+def agmarket_history():
+    """90-day price trend from local dataset only (no live API)."""
+    commodity = request.args.get("commodity", "").strip()
+    days = min(365, max(7, int(request.args.get("days", 90) or 90)))
+    if not commodity:
+        return jsonify({"status": "error", "message": "commodity is required"}), 400
+    time_series, by_mandi, latest = _get_local_chart_fallback(commodity, days=days)
+    return jsonify({
+        "status": "success",
+        "time_series": time_series or [],
+        "by_mandi": by_mandi or [],
+        "latest_date": latest,
+        "source": "local",
+        "records": [],
+    })
+
+
+def _get_local_commodities_fallback():
+    """Fallback commodity list from local market_prices when CEDA is unavailable."""
+    if market_prices is None or market_prices.empty:
+        return []
+    names = market_prices["commodity"].astype(str).str.strip().dropna().unique()
+    return [{"id": normalize_text(n), "name": n.title() if n else ""} for n in sorted(names) if n]
+
+
+@app.route('/api/ceda/commodities', methods=['GET'])
+def ceda_commodities():
+    """Return commodity list from CEDA Agmarknet; fallback to local data if CEDA fails."""
+    try:
+        items = _fetch_ceda_commodities()
+        commodities = [{"id": c["id"], "name": c["name"]} for c in items if c.get("name") and c.get("id")]
+        if not commodities:
+            commodities = _get_local_commodities_fallback()
+        sort_by_data = request.args.get("sort_by_data", "").strip().lower() in ("1", "true", "yes")
+        if sort_by_data and commodities:
+            available = _get_available_crops_set()
+            def has_data(c):
+                n = normalize_text(c.get("name", ""))
+                if not n:
+                    return False
+                if n in available:
+                    return True
+                for a in available:
+                    if n in a or a in n:
+                        return True
+                return False
+            commodities = sorted(commodities, key=lambda c: (0 if has_data(c) else 1, (c.get("name") or "").lower()))
+        return jsonify({
+            "status": "success",
+            "source": "ceda" if items else "local",
+            "commodities": commodities,
+            "count": len(commodities),
+        })
+    except Exception as e:
+        logger.error(f"Error fetching CEDA commodities: {e}")
+        try:
+            commodities = _get_local_commodities_fallback()
+            return jsonify({
+                "status": "success",
+                "source": "local",
+                "commodities": commodities,
+                "count": len(commodities),
+            })
+        except Exception as e2:
+            logger.error(f"Local fallback failed: {e2}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/agmarket/live', methods=['GET'])
+def agmarket_live():
+    """Fetch live prices from data.gov.in API (aaj ka bhav). 
+    Only uses live APIs - no local data fallback for this endpoint.
+    For price trends and insights, local data is used in other endpoints.
+    """
+    commodity = request.args.get("commodity", "").strip()
+    source = request.args.get("source", "api").strip().lower()
+    if not commodity:
+        return jsonify({"status": "error", "message": "commodity is required"}), 400
+    
+    if source == "local":
+        return jsonify({
+            "status": "success",
+            "source": "local",
+            "live": False,
+            "message": "Using local dataset only.",
+            "records": []
+        })
+    
+    # Try to fetch live data from API only
+    records, err = fetch_agmarket_live(commodity, source=source)
+    
+    if err == "no_api_key":
+        return jsonify({
+            "status": "success",
+            "source": "backend",
+            "live": False,
+            "message": "live price unavailable",
+            "records": []
+        })
+    
+    if records:
+        return jsonify({
+            "status": "success",
+            "source": "agmarknet",
+            "live": True,
+            "records": records[:50],
+            "latest_date": records[0]["date"] if records else None
+        })
+    
+    # API failed or returned no data
+    logger.warning(f"API failed to fetch live prices for {commodity} (err={err})")
+    return jsonify({
+        "status": "success",
+        "source": "backend",
+        "live": False,
+        "message": "live price unavailable",
+        "records": []
+    })
+
 
 @app.route('/api/seasonal-recommendations/<season>', methods=['GET'])
 def seasonal_recommendations(season):
@@ -1025,6 +1748,263 @@ def model_info():
         }
     })
 
+# ============= GLOBAL MARKET ACCESS ENDPOINTS =============
+
+@app.route('/api/global/countries', methods=['GET'])
+def get_global_countries():
+    """Get list of countries with export data"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        countries = global_market_processor.get_countries()
+        return jsonify({
+            "status": "success",
+            "countries": countries,
+            "count": len(countries)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching countries: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/commodities', methods=['GET'])
+def get_global_commodities():
+    """Get list of commodities with export data"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        commodities = global_market_processor.get_commodities()
+        return jsonify({
+            "status": "success",
+            "commodities": commodities,
+            "count": len(commodities)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching commodities: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/export-by-country/<country>', methods=['GET'])
+def get_export_by_country(country):
+    """Get export data for a specific country"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        element_type = request.args.get('element', 'Export quantity')
+        data = global_market_processor.get_export_by_country(country, element_type)
+        
+        if data.empty:
+            return jsonify({
+                "status": "success",
+                "country": country,
+                "exports": [],
+                "message": "No data available"
+            })
+        
+        exports = data.to_dict('records')
+        return jsonify({
+            "status": "success",
+            "country": country,
+            "element": element_type,
+            "exports": exports,
+            "count": len(exports)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching country exports: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/export-demand', methods=['GET'])
+def get_export_demand():
+    """Get global export demand trend"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        commodity = request.args.get('commodity')
+        element_type = request.args.get('element', 'Export quantity')
+        
+        data = global_market_processor.get_global_export_demand(commodity, element_type)
+        
+        if data.empty:
+            return jsonify({
+                "status": "success",
+                "commodity": commodity,
+                "demand": [],
+                "message": "No data available"
+            })
+        
+        demand_list = data.to_dict('records')
+        return jsonify({
+            "status": "success",
+            "commodity": commodity or "All commodities",
+            "element": element_type,
+            "demand": demand_list,
+            "years": data['Year'].tolist()
+        })
+    except Exception as e:
+        logger.error(f"Error fetching export demand: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/commodity-trend/<commodity>', methods=['GET'])
+def get_commodity_trend(commodity):
+    """Get commodity export trend by country"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        element_type = request.args.get('element', 'Export quantity')
+        data = global_market_processor.get_commodity_export_trend(commodity, element_type)
+        
+        if data.empty:
+            return jsonify({
+                "status": "success",
+                "commodity": commodity,
+                "trend": [],
+                "message": "No data available"
+            })
+        
+        # Convert to chart-friendly format
+        trend_data = []
+        for year in data.index:
+            year_data = {"year": int(year)}
+            for country in data.columns:
+                year_data[country] = float(data.loc[year, country]) if pd.notna(data.loc[year, country]) else 0
+            trend_data.append(year_data)
+        
+        return jsonify({
+            "status": "success",
+            "commodity": commodity,
+            "element": element_type,
+            "trend": trend_data,
+            "countries": data.columns.tolist()
+        })
+    except Exception as e:
+        logger.error(f"Error fetching commodity trend: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/top-exporters', methods=['GET'])
+def get_top_exporters():
+    """Get top exporting countries"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        commodity = request.args.get('commodity')
+        year = int(request.args.get('year', 2024))
+        limit = int(request.args.get('limit', 10))
+        element_type = request.args.get('element', 'Export quantity')
+        
+        data = global_market_processor.get_top_exporters(commodity, year, limit, element_type)
+        
+        if data.empty:
+            return jsonify({
+                "status": "success",
+                "commodity": commodity or "All",
+                "year": year,
+                "exporters": [],
+                "message": "No data available"
+            })
+        
+        exporters = data.to_dict('records')
+        return jsonify({
+            "status": "success",
+            "commodity": commodity or "All commodities",
+            "year": year,
+            "element": element_type,
+            "exporters": exporters,
+            "count": len(exporters)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching top exporters: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/country-commodities/<country>', methods=['GET'])
+def get_country_commodities(country):
+    """Get top commodities exported by a country"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        year = request.args.get('year', type=int)
+        limit = int(request.args.get('limit', 20))
+        
+        data = global_market_processor.get_country_commodity_exports(country, year)
+        
+        if data.empty:
+            return jsonify({
+                "status": "success",
+                "country": country,
+                "commodities": [],
+                "message": "No data available"
+            })
+        
+        data = data.head(limit)
+        commodities = data.to_dict('records')
+        
+        return jsonify({
+            "status": "success",
+            "country": country,
+            "year": year,
+            "commodities": commodities,
+            "count": len(commodities)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching country commodities: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/global/demand-forecast', methods=['GET'])
+def get_demand_forecast():
+    """Get export demand forecast"""
+    if not global_market_processor:
+        return jsonify({
+            "status": "error",
+            "message": "Global market data not available"
+        }), 503
+    
+    try:
+        commodity = request.args.get('commodity')
+        country = request.args.get('country')
+        
+        if not commodity:
+            return jsonify({
+                "status": "error",
+                "message": "Commodity parameter required"
+            }), 400
+        
+        forecast = global_market_processor.get_demand_forecast(commodity, country)
+        
+        return jsonify({
+            "status": "success",
+            "commodity": commodity,
+            "country": country or "Global",
+            "forecast": forecast
+        })
+    except Exception as e:
+        logger.error(f"Error generating forecast: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"status": "error", "message": "Endpoint not found"}), 404
@@ -1034,8 +2014,12 @@ def internal_error(error):
     return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 if __name__ == '__main__':
-    # Load models on startup
-    if load_models():
-        app.run(debug=True, host='0.0.0.0', port=5000)
-    else:
-        logger.error("Failed to load models. Exiting...")
+    # Verify models are loaded (they should be from _initialize_app(), but double check)
+    if market_prices is None:
+        logger.warning("Models not yet loaded, attempting to load now...")
+        if not load_models():
+            logger.error("Failed to load models. Exiting...")
+            exit(1)
+    
+    logger.info("✓ Models verified loaded, starting Flask app...")
+    app.run(debug=True, host='0.0.0.0', port=5000)
